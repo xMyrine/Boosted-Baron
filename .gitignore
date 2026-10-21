@@ -1,0 +1,48 @@
+CLAUDE.md
+
+# Secrets: only .env.example is committed
+.env
+.env.*
+!.env.example
+
+# Local data (the SQLite database, API-key lock)
+data/*
+!data/.gitkeep
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches and reports
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Models / experiment outputs
+mlruns/
+*.log
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

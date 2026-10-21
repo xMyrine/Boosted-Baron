@@ -1,0 +1,15 @@
+# SQLite needs no server: the database is a single file. This one-shot service creates it from
+# src/oracle/mirror/schema.sql so anyone can initialise it without installing sqlite locally:
+#
+#   docker compose run --rm db-init
+#
+# Result: ${ORACLE_DATA_DIR}/oracle.sqlite3 (default ./data). Re-running is a no-op.
+services:
+  db-init:
+    build: ./db
+    # Run as the host user so the created file is not owned by root on Linux.
+    # Set HOST_UID/HOST_GID in .env if your ids are not 1000 (`id -u`, `id -g`).
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    volumes:
+      - ${ORACLE_DATA_DIR:-./data}:/data
+      - ./src/oracle/mirror/schema.sql:/schema/schema.sql:ro
