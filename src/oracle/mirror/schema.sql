@@ -1,7 +1,9 @@
--- Oracle of the Rift: mirror schema v1 (SQLite >= 3.37 for STRICT, JSON1 for views).
+-- Oracle of the Rift: mirror schema v2 (SQLite >= 3.37 for STRICT, JSON1 for views).
 -- The single source of the schema. Applied to an empty database (PRAGMA user_version = 0) by
--- `docker compose run --rm db-init` (db/init.sh) and, later, by Mirror.open(). One transaction:
--- the database ends up either fully at v1 or untouched.
+-- `docker compose run --rm db-init` (db/init.sh) and by Mirror.open(). One transaction:
+-- the database ends up either fully at v2 or untouched.
+-- An existing database is upgraded in place by oracle/mirror/migrations.py (ordered, additive). Whoever changes
+-- this file adds the migration for the change; tests/test_bot_migration.py fails when the two disagree.
 --
 -- journal_mode = WAL is persistent in the file (set once by db/init.sh); notebooks read while the crawler writes.
 -- Per-connection PRAGMAs (set in Mirror.open):
@@ -73,7 +75,7 @@ CREATE TABLE fetch_failure (
     k2                TEXT NOT NULL DEFAULT '',
     attempts          INTEGER NOT NULL CHECK (attempts >= 1),
     next_retry_at_ms  INTEGER NOT NULL,      -- now + min(10 min * 2^attempts, 24 h)
-    parked            INTEGER NOT NULL DEFAULT 0 CHECK (parked IN (0, 1)),   -- attempts >= 6; `crawl --retry-parked`
+    parked            INTEGER NOT NULL DEFAULT 0 CHECK (parked IN (0, 1)),   -- attempts >= 6; cleared by `oracle retry-failed`
     last_error        TEXT NOT NULL,         -- never contains the API key
     PRIMARY KEY (kind, k1, k2)
 ) STRICT;
@@ -85,7 +87,7 @@ CREATE TABLE crawl_run (
     ended_ms      INTEGER,                   -- NULL = running, or the process died (harmless)
     spec_json     TEXT NOT NULL,
     calls         INTEGER NOT NULL DEFAULT 0,
-    stop_reason   TEXT                       -- drained|budget|daily_cap|signal|auth|breaker
+    stop_reason   TEXT                       -- drained|budget|daily_cap|error|stopped|interrupted
 ) STRICT;
 
 -- Call accounting for visibility ("how many calls did we spend, on what") and the cross-run daily cap.
@@ -98,6 +100,37 @@ CREATE TABLE api_call_stat (
     outcome    TEXT NOT NULL CHECK (outcome IN ('ok', 'not_found', 'throttled', 'server_error', 'client_error', 'network')),
     calls      INTEGER NOT NULL,
     PRIMARY KEY (day, routing, endpoint, lane, outcome)
+) STRICT;
+
+
+-- One row per live game the bot prophesied about; the row is a small state machine:
+--   pending -> posted | failed        (posted and failed are final)
+-- The INSERT of the pending row is the idempotency claim: the second attempt for the same game inserts nothing and
+-- does nothing. `payload` is the spectator game, so a restart can resume without asking Riot again.
+-- A pending row left by a crash converges on the next start (service.RESUME_WINDOW_MS): resumed if it is recent,
+-- else marked failed. `prophecy_json` is the stored Prophecy (bot/prophecy.py); it is the source of truth that
+-- `oracle prophecies` scores against the finished match, so it is written BEFORE the outcome exists.
+CREATE TABLE prophecy (
+    platform_id         TEXT NOT NULL,                 -- 'EUN1'; the match id is platform_id || '_' || game_id
+    game_id             INTEGER NOT NULL,
+    status              TEXT NOT NULL CHECK (status IN ('pending', 'posted', 'failed')),
+    subject_puuid       TEXT NOT NULL,                 -- the tracked player whose spectator check found the game
+    subject_side        INTEGER NOT NULL CHECK (subject_side IN (100, 200)),
+    payload             TEXT NOT NULL CHECK (json_valid(payload)),
+    claimed_at_ms       INTEGER NOT NULL,
+    finished_at_ms      INTEGER,
+    model_id            TEXT,
+    p_blue              REAL CHECK (p_blue IS NULL OR p_blue BETWEEN 0 AND 1),   -- NULL: the vision was clouded
+    complete            INTEGER CHECK (complete IN (0, 1)),                       -- all ten histories were read
+    prophecy_json       TEXT CHECK (prophecy_json IS NULL OR json_valid(prophecy_json)),
+    discord_message_id  TEXT,
+    error               TEXT,
+    PRIMARY KEY (platform_id, game_id),
+    CHECK ((p_blue IS NULL) = (complete IS NULL)),
+    CHECK (CASE status
+        WHEN 'pending' THEN finished_at_ms IS NULL AND discord_message_id IS NULL
+        WHEN 'posted' THEN finished_at_ms IS NOT NULL AND discord_message_id IS NOT NULL AND prophecy_json IS NOT NULL
+        ELSE finished_at_ms IS NOT NULL AND error IS NOT NULL END)
 ) STRICT;
 
 
@@ -147,8 +180,10 @@ CREATE INDEX history_listing_item_by_match ON history_listing_item(match_id);
 
 -- league-v4 / champion-mastery-v4 return CURRENT state only: each call is an un-refetchable snapshot.
 -- Unranked = '[]': still a row, so we don't ask again.
--- FEATURE RULE (leakage): use the latest snapshot with taken_at_ms <= match start; otherwise the nearest later
--- one plus a lag feature (a later snapshot already contains that game's LP change).
+-- FEATURE RULE (leakage): a snapshot is CLEAN for a match iff it was taken before the match ENDED
+-- (taken_at_ms < game_start_ms + game_duration_s * 1000): rank and mastery only change once a game is over.
+-- Use the latest clean snapshot. The live watcher (`oracle crawl --forever`) takes clean ones for all 10 players
+-- at game start. A later snapshot already contains that game's LP/points change: approximate and leaky.
 CREATE TABLE snapshot (
     kind         TEXT NOT NULL CHECK (kind IN ('league', 'mastery')),
     puuid        TEXT NOT NULL,
@@ -261,6 +296,6 @@ SELECT s.puuid, s.taken_at_ms,
 FROM snapshot s, json_each(s.payload) e
 WHERE s.kind = 'league';
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
 COMMIT;

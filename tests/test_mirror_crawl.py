@@ -147,3 +147,54 @@ def test_projection():
     assert patch_of("15.1.2.3") == "15.1"
     with pytest.raises(PayloadError):
         match_rows(match_json("EUW1_1", 0, [f"p{i}" for i in range(9)] + ["p9"])[:-5])
+
+
+def test_live_game_is_captured_once_with_pre_game_snapshots_for_all_ten(mirror):
+    api = FakeApi(small_world())
+    asyncio.run(mirror.track(api, OWNER))
+    lobby = ["owner", *[f"lobby{i}" for i in range(9)]]
+    api.start_live_game(4242, lobby)
+    spec = DatasetSpec()                                     # league + mastery
+
+    capture = asyncio.run(mirror.capture_live(api, Puuid("owner"), spec))
+    assert capture is not None and capture.game_id == 4242 and capture.snapshots == 20
+    kinds = mirror._con.execute("SELECT kind, count(DISTINCT puuid) FROM snapshot GROUP BY kind").fetchall()
+    assert dict(kinds) == {"league": 10, "mastery": 10}
+
+    calls = sum(api.calls.values())
+    assert asyncio.run(mirror.capture_live(api, Puuid("owner"), spec)) is None    # same game: only 1 spectator call
+    assert sum(api.calls.values()) == calls + 1
+
+
+def test_live_game_in_another_queue_is_archived_without_snapshots(mirror):
+    api = FakeApi(small_world())
+    api.start_live_game(7, ["owner", *[f"aram{i}" for i in range(9)]], queue=450)
+    capture = asyncio.run(mirror.capture_live(api, Puuid("owner"), DatasetSpec()))
+    assert capture is not None and capture.snapshots == 0
+    assert mirror._con.execute("SELECT count(*) FROM snapshot").fetchone()[0] == 0
+    assert mirror._con.execute("SELECT count(*) FROM live_game").fetchone()[0] == 1
+
+
+def test_not_in_game_costs_one_call_and_writes_nothing(mirror):
+    api = FakeApi(small_world())
+    assert asyncio.run(mirror.capture_live(api, Puuid("owner"), DatasetSpec())) is None
+    assert api.calls["active_game"] == 1
+    assert mirror._con.execute("SELECT count(*) FROM live_game").fetchone()[0] == 0
+
+
+def test_forever_crawl_watches_tracked_players_for_live_games(mirror):
+    api = FakeApi(small_world())
+    asyncio.run(mirror.track(api, OWNER))
+    api.start_live_game(99, ["owner", *[f"lobby{i}" for i in range(9)]])
+
+    async def run_briefly():
+        stop = asyncio.Event()
+        task = asyncio.create_task(crawl(mirror, FakeGateway(api), SPEC,
+                                         CrawlBudget(forever=True, watch_interval_s=0.05), stop=stop))
+        await asyncio.sleep(0.5)
+        stop.set()
+        return await task
+
+    report = asyncio.run(run_briefly())
+    assert report.results["live game captured"] == 1
+    assert mirror._con.execute("SELECT count(*) FROM live_game").fetchone()[0] == 1

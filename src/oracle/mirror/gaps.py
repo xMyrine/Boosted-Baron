@@ -20,7 +20,7 @@ DAY_MS = 86_400_000
 @dataclass(frozen=True, slots=True)
 class DatasetSpec:
     queue_id: int = 420                  # ranked solo/duo
-    history_n: int = 10                  # prior games per player per anchor. MUST match what the bot uses live.
+    history_n: int = 20                  # prior games per player per anchor. MUST match what the bot uses live.
     lookback_days: int = 120             # tracked players' games older than this are not synced
     max_depth: int = 1                   # 0 = only tracked players' games become training rows
     max_anchors: int = 5000              # promotion stops here

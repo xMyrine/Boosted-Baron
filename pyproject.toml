@@ -5,6 +5,8 @@ description = "Oracle of the Rift: League of Legends match data pipeline and pre
 requires-python = ">=3.13"
 dependencies = [
     "httpx>=0.28.1",
+    "pandas>=3.1.1",
+    "pyarrow>=26.0.1",
 ]
 
 [project.scripts]
@@ -21,6 +23,19 @@ module-name = "oracle"
 testpaths = ["tests"]
 
 [dependency-groups]
+bot = [
+    "discord-py>=2.7.1",
+    "joblib>=1.6.0",
+    "scikit-learn>=1.9.1",
+]
 dev = [
     "pytest>=9.1.1",
+]
+training = [
+    "ipykernel>=7.4.0",
+    "jupyterlab>=4.6.5",
+    "lightgbm>=4.7.0",
+    "matplotlib>=3.11.2",
+    "scikit-learn>=1.9.1",
+    "shap>=0.54.1",
 ]

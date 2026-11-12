@@ -46,3 +46,7 @@ mlruns/
 # OS
 .DS_Store
 Thumbs.db
+
+# Training bundles and trained models (rebuild with `oracle dataset`; never commit data)
+training/data/
+training/artifacts/

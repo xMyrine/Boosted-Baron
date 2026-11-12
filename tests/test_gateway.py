@@ -145,3 +145,15 @@ def test_one_process_owns_the_key(tmp_path):
 def test_api_key_never_appears_in_repr():
     assert "secret" not in repr(ApiKey("RGAPI-secret"))
     assert "secret" not in repr(Settings(ApiKey("RGAPI-secret"), "euw1", None))  # type: ignore[arg-type]
+
+
+def test_settings_find_dotenv_from_a_subfolder(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text('# comment\nRIOT_PLATFORM=eun1\nRIOT_API_KEY="RGAPI-x"\nORACLE_DATA_DIR=./data\n')
+    (tmp_path / "db").mkdir()
+    monkeypatch.chdir(tmp_path / "db")
+    for name in ("RIOT_PLATFORM", "RIOT_API_KEY", "ORACLE_DATA_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings.from_env()
+    assert settings.platform == "eun1" and settings.regional == "europe"
+    assert settings.data_dir == tmp_path / "data"           # relative to the .env, not the cwd
+    assert settings.api_key.reveal() == "RGAPI-x"
