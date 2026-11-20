@@ -9,12 +9,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 from oracle.ids import now_ms
-from oracle.mirror import DatasetSpec, FillResult, Gap, KeyMismatch, Mirror
-from oracle.riot import AuthError, BadRequestError, ForbiddenError, Host, RiotGateway
+from oracle.mirror import DatasetSpec, FillResult, Gap, KeyMismatch, LiveCapture, Mirror
+from oracle.riot import AuthError, BadRequestError, ForbiddenError, Host, RiotError, RiotGateway
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +28,7 @@ class CrawlBudget:
     forever: bool = False                    # keep polling for new games instead of stopping when done
     concurrency: Mapping[Host, int] = field(default_factory=lambda: {Host.REGIONAL: 3, Host.PLATFORM: 2})
     idle_poll_s: float = 60.0
+    watch_interval_s: float = 60.0           # --forever only: how often tracked players are checked for a live game
 
 
 @dataclass
@@ -52,9 +53,12 @@ async def crawl(
     budget: CrawlBudget,
     *,
     stop: asyncio.Event | None = None,
+    on_live: Callable[[LiveCapture], None] | None = None,
 ) -> CrawlReport:
     """Fill gaps until none are left (or forever), the budget is spent, or `stop` is set.
 
+    `on_live` is called (synchronously, so it must not block) for every newly captured live game of a tracked
+    player; the Discord bot uses it to start a prophecy. An exception in the hook is logged, never fatal.
     Safe to cancel at any point (Ctrl-C): an interrupted fill writes nothing, and the next run resumes.
     """
     api = gateway.background()
@@ -120,6 +124,35 @@ async def crawl(
             if host is Host.REGIONAL:
                 regional_done.set()
 
+    async def watch_loop() -> None:
+        """Clean pre-game data: when a tracked player is in a new live game, snapshot all 10 players' rank and
+        mastery right away (rank only changes after a game ends, so these are leak-free training features)."""
+        while not stop.is_set():
+            for _, puuid in mirror.tracked():
+                try:
+                    capture = await mirror.capture_live(api, puuid, spec)
+                except AuthError as exc:
+                    report.stop_reason, report.error = "error", f"AuthError: {exc}"
+                    stop.set()
+                    return
+                except ForbiddenError as exc:
+                    log.error("live watcher disabled: %s", exc)
+                    return
+                except RiotError as exc:
+                    log.warning("live check failed, retrying next round: %s", exc)
+                    continue
+                if capture is not None:
+                    report.results["live game captured"] += 1
+                    log.info("live game %s_%s captured: %d pre-game snapshots",
+                             capture.platform_id, capture.game_id, capture.snapshots)
+                    if on_live is not None:
+                        try:
+                            on_live(capture)
+                        except Exception:
+                            log.exception("on_live hook failed for %s_%s", capture.platform_id, capture.game_id)
+            mirror.record_calls(gateway.drain_stats())
+            await idle(budget.watch_interval_s)
+
     try:
         try:
             await mirror.verify_key(api)
@@ -127,7 +160,10 @@ async def crawl(
             report.stop_reason = "error"
             report.error = f"{type(exc).__name__}: {exc}"
             return report
-        await asyncio.gather(lane_loop(Host.REGIONAL), lane_loop(Host.PLATFORM))
+        loops = [lane_loop(Host.REGIONAL), lane_loop(Host.PLATFORM)]
+        if budget.forever:
+            loops.append(watch_loop())
+        await asyncio.gather(*loops)
         report.stop_reason = report.stop_reason or ("stopped" if stop.is_set() else "drained")
         return report
     finally:

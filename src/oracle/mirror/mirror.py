@@ -12,12 +12,14 @@ gaps are derived from the data, a restart simply recomputes what is still missin
 
 from __future__ import annotations
 
+import asyncio
 import importlib.resources
+import json
 import logging
 import re
 import sqlite3
 import zlib
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,8 +27,9 @@ from enum import Enum
 from pathlib import Path
 
 from oracle.ids import EpochMs, MatchId, Puuid, RiotId, now_ms
-from oracle.mirror import _frontier
+from oracle.mirror import _frontier, _prophecy, migrations
 from oracle.mirror._project import PARSER_VERSION, PayloadError, match_rows
+from oracle.mirror._prophecy import ProphecyClaim, ProphecyCounts, ScoredProphecy
 from oracle.mirror.gaps import (
     DatasetSpec,
     FetchMatch,
@@ -37,22 +40,58 @@ from oracle.mirror.gaps import (
     SyncTracked,
     TakeSnapshot,
 )
-from oracle.riot import GONE, BadRequestError, Doc, Gone, Host, RiotApi, TransientError
+from oracle.riot import (
+    GONE,
+    AuthError,
+    BadRequestError,
+    Doc,
+    ForbiddenError,
+    Gone,
+    Host,
+    RiotApi,
+    RiotError,
+    TransientError,
+)
 
 log = logging.getLogger(__name__)
 
 SCHEMA_SQL = importlib.resources.files("oracle.mirror").joinpath("schema.sql").read_text()
 SCHEMA_VERSION = int(re.search(r"PRAGMA user_version = (\d+);", SCHEMA_SQL).group(1))  # type: ignore[union-attr]
+assert [m.version for m in migrations.MIGRATIONS] == list(range(2, SCHEMA_VERSION + 1)), "a migration is missing for schema.sql"
 
 SYNC_PAGE = 100                   # match-v5 ids: max count per call
 SETTLE_MS = 3 * 3_600_000         # re-list this far back: a game running during a sync shows up later
 FAILURE_BASE_MS = 10 * 60_000     # retry backoff: 10 min * 2^attempts ...
 FAILURE_CAP_MS = 24 * 3_600_000   # ... capped at 24 h
 PARK_AFTER = 6                    # attempts; parked gaps wait for `oracle retry-failed`
+PREPARE_CONCURRENCY = 5           # live preparation: fills in flight (the limiter still paces the sends)
 
 
 class KeyMismatch(Exception):
     """The API key belongs to a different Riot app than the one that produced the stored PUUIDs."""
+
+
+@dataclass(frozen=True, slots=True)
+class LiveCapture:
+    """A newly seen live game, how many pre-game snapshots were taken, and who found it."""
+
+    platform_id: str
+    game_id: int
+    queue_id: int | None
+    snapshots: int
+    subject: Puuid     # the tracked player whose spectator check found the game
+    payload: str       # the spectator-v5 game as JSON text, as archived in live_game
+
+
+@dataclass
+class PrepareReport:
+    """What `prepare_live` did. Completeness is not decided here: the feature builder's coverage is the judge."""
+
+    listed: int = 0                    # history listings stored
+    fetched: int = 0                   # history matches stored
+    missed: int = 0                    # fills that failed or were refused (budget busy, 5xx, parked)
+    timed_out: bool = False
+    fatal: RiotError | None = None     # 401, 403 or a bad request: nothing more will arrive
 
 
 class FillResult(Enum):
@@ -101,7 +140,7 @@ class Mirror:
 
     @classmethod
     def open(cls, path: Path) -> Mirror:
-        """Open (creating if needed) the database. Applies schema.sql to an empty file."""
+        """Open (creating if needed) the database. Applies schema.sql to an empty file and upgrades an older one."""
         path.parent.mkdir(parents=True, exist_ok=True)
         con = sqlite3.connect(path, isolation_level=None)   # transactions are explicit (see _tx)
         con.execute("PRAGMA foreign_keys = ON")
@@ -112,9 +151,15 @@ class Mirror:
             con.executescript(SCHEMA_SQL)
             con.execute("PRAGMA journal_mode = WAL")
             log.info("created %s at schema v%d", path, SCHEMA_VERSION)
-        elif version != SCHEMA_VERSION:
+        elif version > SCHEMA_VERSION:
             con.close()
-            raise RuntimeError(f"{path} is at schema v{version}, this code expects v{SCHEMA_VERSION}")
+            raise RuntimeError(f"{path} is at schema v{version}, newer than this code (v{SCHEMA_VERSION}): update the code")
+        elif version < SCHEMA_VERSION:
+            try:
+                migrations.upgrade(con, version, SCHEMA_VERSION)
+            except BaseException:
+                con.close()
+                raise
         return cls(con)
 
     @staticmethod
@@ -233,6 +278,150 @@ class Mirror:
         except BadRequestError as exc:
             self._record_failure(gap, str(exc), park=True)
             raise
+
+    async def capture_live(self, api: RiotApi, puuid: Puuid, spec: DatasetSpec) -> LiveCapture | None:
+        """If `puuid` is in a live game we haven't captured yet: snapshot rank/mastery of all 10 players NOW
+        (pre-game, so clean for training) and archive the spectator payload. Returns None if not in a new game.
+
+        Cost: 1 spectator call; for a new game in spec.queue_id, + 10 x len(snapshot_kinds) calls.
+        The live_game row is written LAST, so a crash mid-capture means the next poll captures again.
+        """
+        doc = await api.active_game(puuid)
+        if doc is None:
+            return None
+        game = doc.json()
+        platform_id, game_id = str(game["platformId"]), int(game["gameId"])
+        if self._con.execute("SELECT 1 FROM live_game WHERE platform_id = ? AND game_id = ?",
+                             (platform_id, game_id)).fetchone():
+            return None
+        queue_id = game.get("gameQueueConfigId")
+        taken = 0
+        if queue_id == spec.queue_id:
+            players = [Puuid(p["puuid"]) for p in game.get("participants", []) if p.get("puuid")]
+            for player in players:
+                for kind in spec.snapshot_kinds:
+                    if await self.fill(TakeSnapshot(SnapshotKind(kind), player), api) is FillResult.FILLED:
+                        taken += 1
+        with self._tx() as con:
+            con.execute("INSERT OR IGNORE INTO live_game (platform_id, game_id, taken_at_ms, payload) VALUES (?, ?, ?, ?)",
+                        (platform_id, game_id, now_ms(), doc.body.decode()))
+        return LiveCapture(platform_id, game_id, queue_id, taken, puuid, doc.body.decode())
+
+    async def prepare_live(
+        self,
+        api: RiotApi,
+        puuids: Sequence[Puuid],
+        before_ms: EpochMs,
+        *,
+        queue_id: int,
+        history_n: int,
+        deadline_s: float,
+        concurrency: int = PREPARE_CONCURRENCY,
+    ) -> PrepareReport:
+        """Fetch what `features_for_live` needs for a live game: each player's history listing at `before_ms`, then
+        the listed matches that are not stored. Reuses `fill`, so everything fetched is normal mirror data and
+        a second call for the same game only repeats what is still missing.
+
+        Cost: up to len(puuids) listings + len(puuids) x history_n matches (less where players are already known).
+        Runs under `deadline_s` in total; a cancelled fill writes nothing, so a timeout loses nothing but time.
+        """
+        report = PrepareReport()
+        try:
+            async with asyncio.timeout(deadline_s):
+                await self._fill_all(self._missing_listings(puuids, before_ms, queue_id, history_n), api, concurrency,
+                                     report)
+                await self._fill_all(self._missing_history_matches(puuids, before_ms, queue_id), api, concurrency,
+                                     report)
+        except TimeoutError:
+            report.timed_out = True
+        return report
+
+    def _missing_listings(self, puuids: Sequence[Puuid], before_ms: EpochMs, queue_id: int, n: int) -> list[Gap]:
+        have = dict(self._con.execute(
+            f"""SELECT puuid, n_requested FROM history_listing WHERE queue_id = ? AND before_ms = ?
+                AND puuid IN ({",".join("?" * len(puuids))})""", (queue_id, before_ms, *puuids)))
+        return [ListHistory(p, queue_id, before_ms, n) for p in puuids if have.get(p, 0) < n]
+
+    def _missing_history_matches(self, puuids: Sequence[Puuid], before_ms: EpochMs, queue_id: int) -> list[Gap]:
+        rows = self._con.execute(
+            f"""SELECT DISTINCT li.match_id FROM history_listing_item li
+                WHERE li.queue_id = ? AND li.before_ms = ? AND li.puuid IN ({",".join("?" * len(puuids))})
+                  AND NOT EXISTS (SELECT 1 FROM raw_match r WHERE r.match_id = li.match_id)""",
+            (queue_id, before_ms, *puuids))
+        return [FetchMatch(MatchId(match_id)) for (match_id,) in rows]
+
+    async def _fill_all(self, gaps: list[Gap], api: RiotApi, concurrency: int, report: PrepareReport) -> None:
+        slots = asyncio.Semaphore(concurrency)
+
+        async def one(gap: Gap) -> None:
+            async with slots:
+                if report.fatal is not None:
+                    return
+                try:
+                    result = await self.fill(gap, api)
+                except (AuthError, ForbiddenError, BadRequestError) as exc:
+                    report.fatal = exc
+                    return
+                except RiotError:   # DeadlineExceeded: the budget is busy and nothing was sent
+                    report.missed += 1
+                    return
+                if result is FillResult.DEFERRED:
+                    report.missed += 1
+                elif isinstance(gap, ListHistory):
+                    report.listed += 1
+                else:
+                    report.fetched += 1
+
+        await asyncio.gather(*(one(gap) for gap in gaps))
+
+    # ---------------------------------------------------------------- prophecies (the bot's state machine)
+
+    def unprophesied_live_games(self, since_ms: int) -> list[LiveCapture]:
+        """Ranked-queue games archived by the live watcher since `since_ms` that have no prophecy row: games the bot
+        was not running for (or crashed on) when they were found. The subject is the first tracked player in the game."""
+        rows = self._con.execute(
+            """SELECT l.platform_id, l.game_id, l.payload FROM live_game l
+               WHERE l.taken_at_ms >= ?
+                 AND NOT EXISTS (SELECT 1 FROM prophecy p WHERE p.platform_id = upper(l.platform_id) AND p.game_id = l.game_id)
+               GROUP BY l.platform_id, l.game_id ORDER BY min(l.taken_at_ms)""", (since_ms,)).fetchall()
+        tracked = [puuid for _, puuid in self.tracked()]
+        found = []
+        for platform_id, game_id, payload in rows:
+            game = json.loads(payload)
+            present = {p.get("puuid") for p in game.get("participants", [])}
+            subject = next((p for p in tracked if p in present), None)
+            if subject is not None:
+                found.append(LiveCapture(platform_id, game_id, game.get("gameQueueConfigId"), 0, subject, payload))
+        return found
+
+    def claim_prophecy(self, platform_id: str, game_id: int, subject: Puuid, side: int,
+                       payload: str) -> ProphecyClaim | None:
+        """Insert the pending row. The claim if this caller now owns the game, None if it was already claimed."""
+        with self._tx() as con:
+            return _prophecy.claim(con, platform_id.upper(), game_id, subject, side, payload, now_ms())
+
+    def record_prophecy(self, platform_id: str, game_id: int, *, model_id: str, p_blue: float | None,
+                        complete: bool | None, result_json: str) -> bool:
+        with self._tx() as con:
+            return _prophecy.record(con, platform_id.upper(), game_id, model_id=model_id, p_blue=p_blue,
+                                    complete=complete, result_json=result_json)
+
+    def finish_prophecy(self, platform_id: str, game_id: int, *, message_id: str) -> bool:
+        with self._tx() as con:
+            return _prophecy.finish(con, platform_id.upper(), game_id, message_id=message_id, now_ms=now_ms())
+
+    def fail_prophecy(self, platform_id: str, game_id: int, *, error: str) -> bool:
+        with self._tx() as con:
+            return _prophecy.fail(con, platform_id.upper(), game_id, error=error, now_ms=now_ms())
+
+    def pending_prophecies(self) -> list[ProphecyClaim]:
+        return _prophecy.pending(self._con)
+
+    def prophecy_counts(self) -> ProphecyCounts:
+        return _prophecy.counts(self._con)
+
+    def scored_prophecies(self) -> list[ScoredProphecy]:
+        return _prophecy.scored(self._con)
 
     def promote(self, spec: DatasetSpec, now: EpochMs) -> int:
         """Turn fetched history games of shallower anchors into new anchors, within the WIP and size limits."""

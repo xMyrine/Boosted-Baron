@@ -50,6 +50,7 @@ class FakeApi:
         self.calls: Counter[str] = Counter()
         self.transient_failures: Counter[str] = Counter()   # match_id -> how many times to fail first
         self.block: asyncio.Event | None = None              # if set, match() waits on it (simulate in-flight)
+        self.live: dict[str, dict] = {}                       # puuid -> spectator payload
 
     async def account(self, riot_id: RiotId) -> Puuid | None:
         self.calls["account"] += 1
@@ -93,7 +94,19 @@ class FakeApi:
         return Doc(b"[]")
 
     async def active_game(self, puuid: Puuid) -> Doc | None:
-        return None
+        self.calls["active_game"] += 1
+        game = self.live.get(puuid)
+        return None if game is None else Doc(json.dumps(game).encode())
+
+    def start_live_game(self, game_id: int, puuids: list[str], *, queue: int = 420) -> None:
+        """Put these 10 players in a spectator-visible game (spectator-v5 shape: no roles, no outcome)."""
+        game = {
+            "gameId": game_id, "platformId": "EUN1", "gameQueueConfigId": queue, "gameStartTime": 0,
+            "participants": [{"puuid": p, "championId": 10 + i, "teamId": 100 if i < 5 else 200}
+                             for i, p in enumerate(puuids)],
+        }
+        for p in puuids:
+            self.live[p] = game
 
 
 class FakeGateway:

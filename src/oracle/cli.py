@@ -6,7 +6,9 @@ import argparse
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
+from oracle.bot.errors import BotError
 from oracle.config import ConfigError, Settings
 from oracle.crawl import CrawlBudget, crawl
 from oracle.ids import RiotId
@@ -32,6 +34,37 @@ async def _crawl(settings: Settings, args: argparse.Namespace) -> int:
     return 1 if report.error else 0
 
 
+def _dataset(settings: Settings, out: Path | None) -> None:
+    from oracle.features import Dataset   # pandas import is slow: only for this command
+
+    con = Mirror.read_only(settings.db_path)
+    try:
+        ds = Dataset.build(con)
+    finally:
+        con.close()
+    m = ds.manifest
+    target = out or settings.data_dir.parent / "training" / "data" / m["dataset_id"].replace("@", "-")
+    ds.save(target)
+    print(f"{m['dataset_id']}: {m['rows']['matches']} matches, {m['rows']['seats']} seats "
+          f"({m['skipped']['incomplete_history']} anchors skipped: history not complete yet)")
+    print(f"patches {m['patches'][0] if m['patches'] else '-'}..{m['patches'][-1] if m['patches'] else '-'}; "
+          f"saved to {target}")
+
+
+def _prophesy(settings: Settings, args: argparse.Namespace) -> int:
+    from oracle.bot.replay import replay   # pandas and scikit-learn load only for the bot commands
+
+    result = replay(settings, args.match_id, args.seat)
+    print(result.message.as_text())
+    if args.send:
+        from oracle.bot.announce import send_once
+
+        assert settings.discord is not None   # Settings.from_env(require_discord=True) guarantees it
+        message_id = asyncio.run(send_once(settings.discord, result.message))
+        print(f"\nsent to channel {settings.discord.channel_id} (message {message_id})")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="oracle", description="Riot data pipeline for Oracle of the Rift.")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -45,15 +78,28 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="progress, gaps and failures (no API calls)")
     sub.add_parser("reproject", help="re-parse stored raw JSON after a parser change (no API calls)")
     sub.add_parser("retry-failed", help="clear failure backoffs so failed fetches are retried")
+    ds_p = sub.add_parser("dataset", help="build the training bundle (parquet + manifest) for the notebooks (no API calls)")
+    ds_p.add_argument("--out", type=Path, default=None, help="output folder (default: training/data/<dataset id>)")
+    bot_p = sub.add_parser("bot", help="run the Discord bot: crawl forever and prophesy every ranked game of a tracked player")
+    bot_p.add_argument("--dry-run", action="store_true", help="print prophecies instead of posting them (no Discord needed)")
+    sub.add_parser("prophecies", help="score the stored prophecies against finished games (no API calls)")
+    pro_p = sub.add_parser("prophesy", help="replay a stored game as if it were live and show the real result (no API calls)")
+    pro_p.add_argument("match_id", nargs="?", default=None, help="e.g. EUN1_4017659773 (default: newest with complete history)")
+    pro_p.add_argument("--seat", type=int, default=None, help="participant 1-10 who plays the subject (default: first tracked player)")
+    pro_p.add_argument("--send", action="store_true", help="also post the message to the Discord channel")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("httpx").setLevel(logging.WARNING)   # it logs every request URL at INFO
 
-    needs_key = args.command in ("track", "crawl")
+    needs_key = args.command in ("track", "crawl", "bot")
     try:
-        settings = Settings.from_env(require_key=needs_key)
+        settings = Settings.from_env(
+            require_key=needs_key,
+            require_model=args.command in ("prophesy", "bot"),
+            require_discord=(args.command == "prophesy" and args.send) or (args.command == "bot" and not args.dry_run),
+        )
         match args.command:
             case "track":
                 asyncio.run(_track(settings, RiotId.parse(args.riot_id)))
@@ -74,13 +120,26 @@ def main(argv: list[str] | None = None) -> int:
                 with Mirror.open(settings.db_path) as mirror:
                     ok, failed = mirror.reproject()
                 print(f"reprojected {ok} matches, {failed} failed")
+            case "dataset":
+                _dataset(settings, args.out)
             case "retry-failed":
                 with Mirror.open(settings.db_path) as mirror:
                     print(f"cleared {mirror.retry_failed()} failure rows")
+            case "prophesy":
+                return _prophesy(settings, args)
+            case "bot":
+                from oracle.bot.app import run_bot
+
+                return asyncio.run(run_bot(settings, dry_run=args.dry_run))
+            case "prophecies":
+                from oracle.bot.scoring import report
+
+                with Mirror.open(settings.db_path) as mirror:
+                    print(report(mirror.prophecy_counts(), mirror.scored_prophecies()))
     except KeyboardInterrupt:
         print("\nstopped. Nothing is lost: rerun the same command to resume.")
         return 130
-    except (ConfigError, KeyInUse, LookupError, ValueError, RiotError) as exc:
+    except (BotError, ConfigError, KeyInUse, LookupError, ValueError, RiotError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0

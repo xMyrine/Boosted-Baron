@@ -118,3 +118,12 @@ def match_rows(body: bytes) -> tuple[MatchRow, list[ParticipantRow]]:
     except (KeyError, TypeError, ValueError) as exc:
         raise PayloadError(f"cannot project match: {exc!r}") from exc
     return match, participants
+
+
+def champion_names(body: bytes) -> dict[int, str]:
+    """{championId: championName} for one match's participants. Names are Data Dragon ids, e.g. 'TwistedFate'."""
+    try:
+        return {int(p["championId"]): str(p["championName"]) for p in json.loads(body)["info"]["participants"]
+                if p.get("championName")}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PayloadError(f"no champion names in payload: {exc}") from exc
